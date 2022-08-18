@@ -21,6 +21,9 @@
 
 #include "timer.h"
 
+#include "dhcp.h"
+#include "dns.h"
+
 #include "mbedtls/x509_crt.h"
 #include "mbedtls/error.h"
 #include "mbedtls/ssl.h"
@@ -39,7 +42,15 @@
 #define ETHERNET_BUF_MAX_SIZE (1024 * 2)
 
 /* Socket */
-#define SOCKET_SSL 0
+#define SOCKET_DHCP 0
+#define SOCKET_DNS 1
+
+/* Retry count */
+#define DHCP_RETRY_COUNT 5
+#define DNS_RETRY_COUNT 5
+
+/* Socket */
+#define SOCKET_SSL 2
 
 /* Port */
 #define PORT_SSL 443
@@ -53,18 +64,29 @@
 static wiz_NetInfo g_net_info =
     {
         .mac = {0x00, 0x08, 0xDC, 0x12, 0x34, 0x56}, // MAC address
-        .ip = {192, 168, 11, 2},                     // IP address
+        .ip = {192, 168, 4, 139},                     // IP address
         .sn = {255, 255, 255, 0},                    // Subnet Mask
-        .gw = {192, 168, 11, 1},                     // Gateway
+        .gw = {192, 168, 4, 254},                     // Gateway
         .dns = {8, 8, 8, 8},                         // DNS server
-        .dhcp = NETINFO_STATIC                       // DHCP enable/disable
+        .dhcp = NETINFO_DHCP                       // DHCP enable/disable
 };
+static uint8_t g_ethernet_buf[ETHERNET_BUF_MAX_SIZE] = {
+    0,
+}; // common buffer
+
+
+/* DNS */
+static uint8_t g_dns_target_domain[] = "ws.evc-net.com";
+static uint8_t g_dns_target_ip[4] = {
+    0,
+};
+
 
 /* SSL */
 static uint8_t g_ssl_buf[ETHERNET_BUF_MAX_SIZE] = {
     0,
 };
-static uint8_t g_ssl_target_ip[4] = {192, 168, 11, 3};
+static uint8_t g_ssl_target_ip[4] = {0, 0, 0, 0};
 
 static mbedtls_ctr_drbg_context g_ctr_drbg;
 static mbedtls_ssl_config g_conf;
@@ -80,6 +102,12 @@ static volatile uint32_t g_msec_cnt = 0;
  */
 /* Clock */
 static void set_clock_khz(void);
+
+/* DHCP */
+static void wizchip_dhcp_init(void);
+static void wizchip_dhcp_assign(void);
+static void wizchip_dhcp_conflict(void);
+
 
 /* SSL */
 static int wizchip_ssl_init(uint8_t *socket_fd);
@@ -116,51 +144,52 @@ int main()
 
     wizchip_1ms_timer_initialize(repeating_timer_callback);
 
-    network_initialize(g_net_info);
+    wizchip_dhcp_init();
 
-    /* Get network information */
-    print_network_information(g_net_info);
+    DNS_init(SOCKET_DNS, g_ethernet_buf);
 
-    retval = wizchip_ssl_init(SOCKET_SSL);
+    uint8_t dhcp_state = 99;
+    uint8_t dhcp_retry = 0;
+    while (1) {
+        dhcp_state = DHCP_run();
 
-    if (retval < 0)
-    {
-        printf(" SSL initialize failed %d\n", retval);
-
-        while (1)
-            ;
-    }
-
-    /* Get ciphersuite information */
-    printf(" Supported ciphersuite lists\n");
-
-    list = mbedtls_ssl_list_ciphersuites();
-
-    while (*list)
-    {
-        printf(" %-42s\n", mbedtls_ssl_get_ciphersuite_name(*list));
-
-        list++;
-
-        if (!*list)
-        {
+        if (dhcp_state == DHCP_IP_LEASED) {
             break;
         }
+        if (dhcp_state == DHCP_FAILED) {
+            dhcp_retry++;
+        }
+        if (dhcp_retry > DHCP_RETRY_COUNT) {
+            DHCP_stop();
 
-        printf(" %s\n", mbedtls_ssl_get_ciphersuite_name(*list));
+            while (1);
+        }
 
-        list++;
+        wizchip_delay_ms(1000); // wait for 1 second
     }
 
-    retval = socket((uint8_t)(g_ssl.p_bio), Sn_MR_TCP, PORT_SSL, SF_TCP_NODELAY);
+    uint8_t dns_retry = 0;
+    while (1) {
+        if (DNS_run(g_net_info.dns, g_dns_target_domain, g_dns_target_ip) > 0) {
+            for (size_t i = 0; i < 4; i++) {
+                g_ssl_target_ip[i] = g_dns_target_ip[i];
+            }
+            break;
+        } else {
+            dns_retry++;
+        }
 
-    if (retval != SOCKET_SSL)
-    {
-        printf(" Socket failed %d\n", retval);
+        if (dns_retry > DNS_RETRY_COUNT) {
+            while (1);
+        }
 
-        while (1)
-            ;
+        wizchip_delay_ms(1000); // wait for 1 second
     }
+
+
+
+    wizchip_ssl_init(SOCKET_SSL);
+    socket((uint8_t)(g_ssl.p_bio), Sn_MR_TCP, PORT_SSL, SF_TCP_NODELAY);
 
     start_ms = millis();
 
@@ -178,8 +207,7 @@ int main()
     {
         printf(" Connect failed %d\n", retval);
 
-        while (1)
-            ;
+        while (1);
     }
 
     printf(" Connected %d\n", retval);
@@ -189,9 +217,7 @@ int main()
         if ((retval != MBEDTLS_ERR_SSL_WANT_READ) && (retval != MBEDTLS_ERR_SSL_WANT_WRITE))
         {
             printf(" failed\n  ! mbedtls_ssl_handshake returned -0x%x\n", -retval);
-
-            while (1)
-                ;
+            while (1) ;
         }
     }
 
@@ -243,6 +269,43 @@ static void set_clock_khz(void)
         PLL_SYS_KHZ * 1000                                // Output (must be same as no divider)
     );
 }
+
+
+//DHCP
+static void wizchip_dhcp_init(void)
+{
+    printf(" DHCP client running\n");
+
+    DHCP_init(SOCKET_DHCP, g_ethernet_buf);
+
+    reg_dhcp_cbfunc(wizchip_dhcp_assign, wizchip_dhcp_assign, wizchip_dhcp_conflict);
+}
+
+static void wizchip_dhcp_assign(void)
+{
+    getIPfromDHCP(g_net_info.ip);
+    getGWfromDHCP(g_net_info.gw);
+    getSNfromDHCP(g_net_info.sn);
+    getDNSfromDHCP(g_net_info.dns);
+
+    g_net_info.dhcp = NETINFO_DHCP;
+
+    /* Network initialize */
+    network_initialize(g_net_info); // apply from DHCP
+
+    print_network_information(g_net_info);
+    printf(" DHCP leased time : %ld seconds\n", getDHCPLeasetime());
+}
+
+static void wizchip_dhcp_conflict(void)
+{
+    printf(" Conflict IP from DHCP\n");
+
+    // halt or reset or any...
+    while (1)
+        ; // this example is halt.
+}
+
 
 /* SSL */
 static int wizchip_ssl_init(uint8_t *socket_fd)
