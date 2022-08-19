@@ -126,7 +126,6 @@ static time_t millis(void);
 int main()
 {
     /* Initialize */
-    const int *list = NULL;
     uint16_t len = 0;
     uint32_t retval = 0;
     uint32_t start_ms = 0;
