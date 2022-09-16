@@ -63,11 +63,11 @@
 /* Network */
 static wiz_NetInfo g_net_info =
     {
-        .mac = {0x00, 0x08, 0xDC, 0x12, 0x34, 0x56}, // MAC address
-        .ip = {192, 168, 4, 139},                     // IP address
-        .sn = {255, 255, 255, 0},                    // Subnet Mask
-        .gw = {192, 168, 4, 254},                     // Gateway
-        .dns = {8, 8, 8, 8},                         // DNS server
+        .mac = {0x00, 0x08, 0xDC, 0x12, 0xDE, 0xAD}, // MAC address
+        // .ip = {192, 168, 4, 136},                     // IP address
+        // .sn = {255, 255, 255, 0},                    // Subnet Mask
+        // .gw = {192, 168, 4, 254},                     // Gateway
+        // .dns = {1, 1, 1, 1},                         // DNS server
         .dhcp = NETINFO_DHCP                       // DHCP enable/disable
 };
 static uint8_t g_ethernet_buf[ETHERNET_BUF_MAX_SIZE] = {
@@ -76,6 +76,7 @@ static uint8_t g_ethernet_buf[ETHERNET_BUF_MAX_SIZE] = {
 
 
 /* DNS */
+// static uint8_t g_dns_target_domain[] = "ppr-ocppj.greenmotion.tech";
 static uint8_t g_dns_target_domain[] = "ws.evc-net.com";
 static uint8_t g_dns_target_ip[4] = {
     0,
@@ -86,7 +87,7 @@ static uint8_t g_dns_target_ip[4] = {
 static uint8_t g_ssl_buf[ETHERNET_BUF_MAX_SIZE] = {
     0,
 };
-static uint8_t g_ssl_target_ip[4] = {0, 0, 0, 0};
+static uint8_t g_ssl_target_ip[4] = {52, 209, 222, 215};
 
 static mbedtls_ctr_drbg_context g_ctr_drbg;
 static mbedtls_ssl_config g_conf;
@@ -125,6 +126,9 @@ static time_t millis(void);
  */
 int main()
 {
+    gpio_init(21);
+    gpio_set_dir(21, GPIO_OUT);
+    gpio_put(21, 1);
     /* Initialize */
     uint16_t len = 0;
     uint32_t retval = 0;
@@ -137,6 +141,7 @@ int main()
     wizchip_spi_initialize();
     wizchip_cris_initialize();
 
+    gpio_set_pulls(PIN_RST, true, false);
     wizchip_reset();
     wizchip_initialize();
     wizchip_check();
@@ -151,8 +156,11 @@ int main()
     uint8_t dhcp_retry = 0;
     while (1) {
         dhcp_state = DHCP_run();
+        //get stuck in dhcp discover
+        send_DHCP_DISCOVER();
 
         if (dhcp_state == DHCP_IP_LEASED) {
+            dhcp_retry--;
             break;
         }
         if (dhcp_state == DHCP_FAILED) {
